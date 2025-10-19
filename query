@@ -1,0 +1,1 @@
+My algorithm is that I maintain a roaring bitmap spanning n records ('n' denoting total records). The main idea is that I maintain 2 indices one non-negative and the other negative. Such as, if the 2nd record's value is 'hello', then h[0] = "x1x..."
