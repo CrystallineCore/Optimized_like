@@ -1,17 +1,18 @@
 /*
  * optimized_like_roaring.c
- * PostgreSQL extension with Roaring Bitmap optimization
- * OPTIMIZED: Fast AND accurate - fixed bitmap logic without verification overhead
+ * PostgreSQL extension - ULTIMATE VERSION
  * 
- * KEY OPTIMIZATIONS:
- * 1. Precise bitmap operations - no overcounting
- * 2. Smart candidate filtering with char-anywhere cache
- * 3. Proper contiguous pattern matching for multi-slice patterns
- * 4. Length constraints applied early
- * 5. No expensive verification loops
- * 6. FIXED: Consistent negative index offset calculation
- * 7. FIXED: Deduplication to prevent overcounting
- * 8. FIXED: Multi-slice verification using contiguous pattern matching
+ * Combines correctness from working version with hardware optimizations
+ * 
+ * OPTIMIZATIONS:
+ * 1. Hash tables for O(1) lookups (vs O(n) linear search)
+ * 2. CPU prefetching and cache alignment
+ * 3. Branch prediction hints
+ * 4. Loop unrolling
+ * 5. Query result caching
+ * 6. Bloom filters for fast negatives
+ * 7. Correct contiguous pattern matching
+ * 8. Optimized string search
  */
 
  #include "postgres.h"
@@ -36,78 +37,131 @@
  PG_MODULE_MAGIC;
  #endif
  
+ /* ==================== OPTIMIZATION MACROS ==================== */
+ 
+ #ifndef likely
+ #define likely(x)       __builtin_expect(!!(x), 1)
+ #endif
+ #ifndef unlikely
+ #define unlikely(x)     __builtin_expect(!!(x), 0)
+ #endif
+ #define FORCE_INLINE    __attribute__((always_inline)) inline
+ #define PREFETCH(addr)  __builtin_prefetch(addr, 0, 3)
+ #define ALIGNED(x)      __attribute__((aligned(x)))
+ #define CACHE_ALIGNED   ALIGNED(64)
+ 
+ /* ==================== CONFIGURATION ==================== */
+ 
+ #define MAX_POSITIONS 256
+ #define CHAR_RANGE 256
+ #define HASH_TABLE_SIZE 4096
+ #define QUERY_CACHE_SIZE 512
+ #define BLOOM_SIZE 4096
+ 
+ /* ==================== BLOOM FILTER ==================== */
+ 
+ typedef struct {
+     CACHE_ALIGNED uint64_t bits[BLOOM_SIZE / 64];
+ } BloomFilter;
+ 
+ static FORCE_INLINE void bloom_init(BloomFilter *bf)
+ {
+     memset(bf->bits, 0, sizeof(bf->bits));
+ }
+ 
+ static FORCE_INLINE void bloom_add(BloomFilter *bf, uint32_t hash)
+ {
+     uint32_t h1 = hash % BLOOM_SIZE;
+     uint32_t h2 = (hash * 16777619) % BLOOM_SIZE;
+     uint32_t h3 = (hash * 2654435761U) % BLOOM_SIZE;
+     
+     bf->bits[h1 >> 6] |= (1ULL << (h1 & 63));
+     bf->bits[h2 >> 6] |= (1ULL << (h2 & 63));
+     bf->bits[h3 >> 6] |= (1ULL << (h3 & 63));
+ }
+ 
+ static FORCE_INLINE bool bloom_check(const BloomFilter *bf, uint32_t hash)
+ {
+     uint32_t h1 = hash % BLOOM_SIZE;
+     uint32_t h2 = (hash * 16777619) % BLOOM_SIZE;
+     uint32_t h3 = (hash * 2654435761U) % BLOOM_SIZE;
+     
+     return (bf->bits[h1 >> 6] & (1ULL << (h1 & 63))) &&
+            (bf->bits[h2 >> 6] & (1ULL << (h2 & 63))) &&
+            (bf->bits[h3 >> 6] & (1ULL << (h3 & 63)));
+ }
+ 
  /* ==================== ROARING BITMAP WRAPPER ==================== */
  
  #ifdef HAVE_ROARING
  
  typedef roaring_bitmap_t RoaringBitmap;
  
- static RoaringBitmap* roaring_create(void)
+ static FORCE_INLINE RoaringBitmap* roaring_create(void)
  {
      return roaring_bitmap_create();
  }
  
- static void roaring_add(RoaringBitmap *rb, uint32_t value)
+ static FORCE_INLINE void roaring_add(RoaringBitmap *rb, uint32_t value)
  {
      roaring_bitmap_add(rb, value);
  }
  
- static RoaringBitmap* roaring_and(const RoaringBitmap *a, const RoaringBitmap *b)
+ static FORCE_INLINE RoaringBitmap* roaring_and(const RoaringBitmap *a, const RoaringBitmap *b)
  {
      return roaring_bitmap_and(a, b);
  }
  
- static RoaringBitmap* roaring_or(const RoaringBitmap *a, const RoaringBitmap *b)
+ static FORCE_INLINE RoaringBitmap* roaring_or(const RoaringBitmap *a, const RoaringBitmap *b)
  {
      return roaring_bitmap_or(a, b);
  }
  
- static uint64_t roaring_count(const RoaringBitmap *rb)
+ static FORCE_INLINE uint64_t roaring_count(const RoaringBitmap *rb)
  {
      return roaring_bitmap_get_cardinality(rb);
  }
  
- static bool roaring_is_empty(const RoaringBitmap *rb)
+ static FORCE_INLINE bool roaring_is_empty(const RoaringBitmap *rb)
  {
-     return roaring_bitmap_get_cardinality(rb) == 0;
+     return roaring_bitmap_is_empty(rb);
  }
  
- static uint32_t* roaring_to_array(const RoaringBitmap *rb, uint64_t *count)
+ static FORCE_INLINE uint32_t* roaring_to_array(const RoaringBitmap *rb, uint64_t *count)
  {
-     uint32_t *array;
      *count = roaring_bitmap_get_cardinality(rb);
-     if (*count == 0) return NULL;
-     array = (uint32_t *)palloc(*count * sizeof(uint32_t));
+     if (unlikely(*count == 0)) return NULL;
+     uint32_t *array = (uint32_t *)palloc(*count * sizeof(uint32_t));
      roaring_bitmap_to_uint32_array(rb, array);
      return array;
  }
  
- static size_t roaring_size_bytes(const RoaringBitmap *rb)
+ static FORCE_INLINE size_t roaring_size_bytes(const RoaringBitmap *rb)
  {
      return roaring_bitmap_size_in_bytes(rb);
  }
  
- static void roaring_free(RoaringBitmap *rb)
+ static FORCE_INLINE void roaring_free(RoaringBitmap *rb)
  {
-     if (rb) roaring_bitmap_free(rb);
+     if (likely(rb)) roaring_bitmap_free(rb);
  }
  
- static RoaringBitmap* roaring_copy(const RoaringBitmap *rb)
+ static FORCE_INLINE RoaringBitmap* roaring_copy(const RoaringBitmap *rb)
  {
      return roaring_bitmap_copy(rb);
  }
  
  #else
  
- /* Fallback bitmap implementation */
+ /* Optimized fallback bitmap */
  typedef struct {
-     uint64_t *blocks;
+     CACHE_ALIGNED uint64_t *blocks;
      int num_blocks;
      int capacity;
      bool is_palloc;
  } RoaringBitmap;
  
- static RoaringBitmap* roaring_create(void)
+ static FORCE_INLINE RoaringBitmap* roaring_create(void)
  {
      RoaringBitmap *rb = (RoaringBitmap *)palloc(sizeof(RoaringBitmap));
      rb->num_blocks = 0;
@@ -117,18 +171,16 @@
      return rb;
  }
  
- static void roaring_add(RoaringBitmap *rb, uint32_t value)
+ static FORCE_INLINE void roaring_add(RoaringBitmap *rb, uint32_t value)
  {
      int block = value >> 6;
      int bit = value & 63;
-     int i;
      
-     if (block >= rb->capacity)
+     if (unlikely(block >= rb->capacity))
      {
          int new_cap = block + 1;
          rb->blocks = (uint64_t *)repalloc(rb->blocks, new_cap * sizeof(uint64_t));
-         for (i = rb->capacity; i < new_cap; i++)
-             rb->blocks[i] = 0;
+         memset(rb->blocks + rb->capacity, 0, (new_cap - rb->capacity) * sizeof(uint64_t));
          rb->capacity = new_cap;
      }
      if (block >= rb->num_blocks)
@@ -142,7 +194,7 @@
      int min_blocks = (a->num_blocks < b->num_blocks) ? a->num_blocks : b->num_blocks;
      int i;
      
-     if (min_blocks == 0)
+     if (unlikely(min_blocks == 0))
          return result;
      
      if (result->capacity < min_blocks)
@@ -150,10 +202,19 @@
          result->blocks = (uint64_t *)repalloc(result->blocks, min_blocks * sizeof(uint64_t));
          result->capacity = min_blocks;
      }
-     
      result->num_blocks = min_blocks;
      
-     for (i = 0; i < min_blocks; i++)
+     /* Unrolled loop */
+     for (i = 0; i + 3 < min_blocks; i += 4)
+     {
+         PREFETCH(&a->blocks[i + 8]);
+         PREFETCH(&b->blocks[i + 8]);
+         result->blocks[i] = a->blocks[i] & b->blocks[i];
+         result->blocks[i+1] = a->blocks[i+1] & b->blocks[i+1];
+         result->blocks[i+2] = a->blocks[i+2] & b->blocks[i+2];
+         result->blocks[i+3] = a->blocks[i+3] & b->blocks[i+3];
+     }
+     for (; i < min_blocks; i++)
          result->blocks[i] = a->blocks[i] & b->blocks[i];
      
      return result;
@@ -166,7 +227,7 @@
      int min_blocks = (a->num_blocks < b->num_blocks) ? a->num_blocks : b->num_blocks;
      int i;
      
-     if (max_blocks == 0)
+     if (unlikely(max_blocks == 0))
          return result;
      
      if (result->capacity < max_blocks)
@@ -174,22 +235,17 @@
          result->blocks = (uint64_t *)repalloc(result->blocks, max_blocks * sizeof(uint64_t));
          result->capacity = max_blocks;
      }
-     
      result->num_blocks = max_blocks;
      
      for (i = 0; i < min_blocks; i++)
          result->blocks[i] = a->blocks[i] | b->blocks[i];
      
      if (a->num_blocks > min_blocks)
-     {
          memcpy(result->blocks + min_blocks, a->blocks + min_blocks,
                 (a->num_blocks - min_blocks) * sizeof(uint64_t));
-     }
      else if (b->num_blocks > min_blocks)
-     {
          memcpy(result->blocks + min_blocks, b->blocks + min_blocks,
                 (b->num_blocks - min_blocks) * sizeof(uint64_t));
-     }
      
      return result;
  }
@@ -198,15 +254,23 @@
  {
      uint64_t count = 0;
      int i;
-     for (i = 0; i < rb->num_blocks; i++)
+     
+     for (i = 0; i + 3 < rb->num_blocks; i += 4)
+     {
          count += __builtin_popcountll(rb->blocks[i]);
+         count += __builtin_popcountll(rb->blocks[i+1]);
+         count += __builtin_popcountll(rb->blocks[i+2]);
+         count += __builtin_popcountll(rb->blocks[i+3]);
+     }
+     for (; i < rb->num_blocks; i++)
+         count += __builtin_popcountll(rb->blocks[i]);
+     
      return count;
  }
  
- static bool roaring_is_empty(const RoaringBitmap *rb)
+ static FORCE_INLINE bool roaring_is_empty(const RoaringBitmap *rb)
  {
-     int i;
-     for (i = 0; i < rb->num_blocks; i++)
+     for (int i = 0; i < rb->num_blocks; i++)
          if (rb->blocks[i])
              return false;
      return true;
@@ -219,7 +283,7 @@
      uint64_t bits, base;
      
      *count = roaring_count(rb);
-     if (*count == 0)
+     if (unlikely(*count == 0))
          return NULL;
      
      array = (uint32_t *)palloc(*count * sizeof(uint32_t));
@@ -227,8 +291,7 @@
      for (i = 0; i < rb->num_blocks; i++)
      {
          bits = rb->blocks[i];
-         if (!bits)
-             continue;
+         if (!bits) continue;
          
          base = (uint64_t)i << 6;
          while (bits)
@@ -258,7 +321,6 @@
  static RoaringBitmap* roaring_copy(const RoaringBitmap *rb)
  {
      RoaringBitmap *copy = roaring_create();
-     
      if (rb->num_blocks > 0)
      {
          copy->blocks = (uint64_t *)repalloc(copy->blocks, rb->num_blocks * sizeof(uint64_t));
@@ -271,32 +333,43 @@
  
  #endif
  
- /* ==================== INDEX STRUCTURES ==================== */
+ /* ==================== HASH TABLE STRUCTURES ==================== */
  
- #define MAX_POSITIONS 256
- #define CHAR_RANGE 256
- 
- typedef struct {
+ typedef struct PosHashEntry {
      int pos;
      RoaringBitmap *bitmap;
- } PosEntry;
+     struct PosHashEntry *next;
+ } PosHashEntry;
  
  typedef struct {
-     PosEntry *entries;
-     int count;
-     int capacity;
- } CharIndex;
+     CACHE_ALIGNED PosHashEntry *buckets[HASH_TABLE_SIZE];
+ } PosHashTable;
  
  typedef struct {
      RoaringBitmap **length_bitmaps;
      int max_length;
  } LengthIndex;
  
+ typedef struct CacheEntry {
+     char *pattern;
+     uint32_t *results;
+     uint64_t count;
+     uint64_t last_used;
+     struct CacheEntry *next;
+ } CacheEntry;
+ 
+ typedef struct {
+     CACHE_ALIGNED CacheEntry *entries[QUERY_CACHE_SIZE];
+     uint64_t access_counter;
+     BloomFilter bloom;
+ } QueryCache;
+ 
  typedef struct RoaringIndex {
-     CharIndex pos_idx[CHAR_RANGE];
-     CharIndex neg_idx[CHAR_RANGE];
-     RoaringBitmap *char_cache[CHAR_RANGE];
+     CACHE_ALIGNED PosHashTable pos_idx[CHAR_RANGE];
+     CACHE_ALIGNED PosHashTable neg_idx[CHAR_RANGE];
+     CACHE_ALIGNED RoaringBitmap *char_cache[CHAR_RANGE];
      LengthIndex length_idx;
+     QueryCache query_cache;
      
      char **data;
      int num_records;
@@ -307,90 +380,146 @@
  static RoaringIndex *global_index = NULL;
  static MemoryContext index_context = NULL;
  
- /* Find pos_idx bitmap for (ch, pos) */
- static RoaringBitmap* get_pos_bitmap(unsigned char ch, int pos)
+ /* ==================== HASH FUNCTIONS ==================== */
+ 
+ static FORCE_INLINE uint32_t hash_position(int pos)
  {
-     CharIndex *cidx = &global_index->pos_idx[ch];
-     int i;
+     return ((uint32_t)pos * 2654435761U) & (HASH_TABLE_SIZE - 1);
+ }
+ 
+ static FORCE_INLINE uint32_t hash_string(const char *str)
+ {
+     uint32_t hash = 5381;
+     int c;
      
-     for (i = 0; i < cidx->count; i++)
-         if (cidx->entries[i].pos == pos)
-             return cidx->entries[i].bitmap;
+     while ((c = *str++))
+         hash = ((hash << 5) + hash) + c;
      
+     return hash % QUERY_CACHE_SIZE;
+ }
+ 
+ /* ==================== POSITION BITMAP ACCESS (HASH TABLE) ==================== */
+ 
+ static FORCE_INLINE RoaringBitmap* get_pos_bitmap(unsigned char ch, int pos)
+ {
+     uint32_t bucket = hash_position(pos);
+     PosHashEntry *entry = global_index->pos_idx[ch].buckets[bucket];
+     
+     while (entry)
+     {
+         if (likely(entry->pos == pos))
+             return entry->bitmap;
+         entry = entry->next;
+     }
      return NULL;
  }
  
- /* Find neg_idx bitmap for (ch, neg_offset) - neg_offset is negative (e.g., -1, -2, ...) */
- static RoaringBitmap* get_neg_bitmap(unsigned char ch, int neg_offset)
+ static FORCE_INLINE RoaringBitmap* get_neg_bitmap(unsigned char ch, int neg_offset)
  {
-     CharIndex *cidx = &global_index->neg_idx[ch];
-     int i;
+     uint32_t bucket = hash_position(neg_offset);
+     PosHashEntry *entry = global_index->neg_idx[ch].buckets[bucket];
      
-     for (i = 0; i < cidx->count; i++)
-         if (cidx->entries[i].pos == neg_offset)
-             return cidx->entries[i].bitmap;
-     
+     while (entry)
+     {
+         if (likely(entry->pos == neg_offset))
+             return entry->bitmap;
+         entry = entry->next;
+     }
      return NULL;
  }
  
- /* Set pos_idx entry, creating if needed */
  static void set_pos_bitmap(unsigned char ch, int pos, RoaringBitmap *bm)
  {
-     CharIndex *cidx = &global_index->pos_idx[ch];
-     int i;
+     uint32_t bucket = hash_position(pos);
+     PosHashEntry *entry = global_index->pos_idx[ch].buckets[bucket];
      
-     for (i = 0; i < cidx->count; i++)
+     while (entry)
      {
-         if (cidx->entries[i].pos == pos)
+         if (entry->pos == pos)
          {
-             cidx->entries[i].bitmap = bm;
+             entry->bitmap = bm;
              return;
          }
+         entry = entry->next;
      }
      
-     if (cidx->count >= cidx->capacity)
-     {
-         int new_cap = cidx->capacity * 2;
-         PosEntry *new_entries = (PosEntry *)MemoryContextAlloc(index_context, new_cap * sizeof(PosEntry));
-         if (cidx->count > 0)
-             memcpy(new_entries, cidx->entries, cidx->count * sizeof(PosEntry));
-         cidx->entries = new_entries;
-         cidx->capacity = new_cap;
-     }
-     
-     cidx->entries[cidx->count].pos = pos;
-     cidx->entries[cidx->count].bitmap = bm;
-     cidx->count++;
+     entry = (PosHashEntry *)MemoryContextAlloc(index_context, sizeof(PosHashEntry));
+     entry->pos = pos;
+     entry->bitmap = bm;
+     entry->next = global_index->pos_idx[ch].buckets[bucket];
+     global_index->pos_idx[ch].buckets[bucket] = entry;
  }
  
- /* Set neg_idx entry, creating if needed - neg_offset should be negative */
  static void set_neg_bitmap(unsigned char ch, int neg_offset, RoaringBitmap *bm)
  {
-     CharIndex *cidx = &global_index->neg_idx[ch];
-     int i;
+     uint32_t bucket = hash_position(neg_offset);
+     PosHashEntry *entry = global_index->neg_idx[ch].buckets[bucket];
      
-     for (i = 0; i < cidx->count; i++)
+     while (entry)
      {
-         if (cidx->entries[i].pos == neg_offset)
+         if (entry->pos == neg_offset)
          {
-             cidx->entries[i].bitmap = bm;
+             entry->bitmap = bm;
              return;
          }
+         entry = entry->next;
      }
      
-     if (cidx->count >= cidx->capacity)
+     entry = (PosHashEntry *)MemoryContextAlloc(index_context, sizeof(PosHashEntry));
+     entry->pos = neg_offset;
+     entry->bitmap = bm;
+     entry->next = global_index->neg_idx[ch].buckets[bucket];
+     global_index->neg_idx[ch].buckets[bucket] = entry;
+ }
+ 
+ /* ==================== QUERY CACHE ==================== */
+ 
+ static void init_query_cache(void)
+ {
+     for (int i = 0; i < QUERY_CACHE_SIZE; i++)
+         global_index->query_cache.entries[i] = NULL;
+     global_index->query_cache.access_counter = 0;
+     bloom_init(&global_index->query_cache.bloom);
+ }
+ 
+ static CacheEntry* cache_lookup(const char *pattern)
+ {
+     uint32_t hash = hash_string(pattern);
+     
+     if (!bloom_check(&global_index->query_cache.bloom, hash))
+         return NULL;
+     
+     CacheEntry *entry = global_index->query_cache.entries[hash];
+     
+     while (entry)
      {
-         int new_cap = cidx->capacity * 2;
-         PosEntry *new_entries = (PosEntry *)MemoryContextAlloc(index_context, new_cap * sizeof(PosEntry));
-         if (cidx->count > 0)
-             memcpy(new_entries, cidx->entries, cidx->count * sizeof(PosEntry));
-         cidx->entries = new_entries;
-         cidx->capacity = new_cap;
+         if (strcmp(entry->pattern, pattern) == 0)
+         {
+             entry->last_used = ++global_index->query_cache.access_counter;
+             return entry;
+         }
+         entry = entry->next;
      }
+     return NULL;
+ }
+ 
+ static void cache_insert(const char *pattern, uint32_t *results, uint64_t count)
+ {
+     if (count > 50000) return;
      
-     cidx->entries[cidx->count].pos = neg_offset;
-     cidx->entries[cidx->count].bitmap = bm;
-     cidx->count++;
+     uint32_t hash = hash_string(pattern);
+     CacheEntry *entry = (CacheEntry *)MemoryContextAlloc(index_context, sizeof(CacheEntry));
+     
+     entry->pattern = MemoryContextStrdup(index_context, pattern);
+     entry->results = (uint32_t *)MemoryContextAlloc(index_context, count * sizeof(uint32_t));
+     memcpy(entry->results, results, count * sizeof(uint32_t));
+     entry->count = count;
+     entry->last_used = ++global_index->query_cache.access_counter;
+     
+     entry->next = global_index->query_cache.entries[hash];
+     global_index->query_cache.entries[hash] = entry;
+     
+     bloom_add(&global_index->query_cache.bloom, hash);
  }
  
  /* ==================== PATTERN ANALYSIS ==================== */
@@ -402,7 +531,7 @@
      bool ends_with_percent;
  } PatternInfo;
  
- static int count_non_wildcard(const char *s)
+ static FORCE_INLINE int count_non_wildcard(const char *s)
  {
      int count = 0;
      while (*s)
@@ -426,10 +555,8 @@
      
      info->starts_with_percent = (plen > 0 && pattern[0] == '%');
      info->ends_with_percent = (plen > 0 && pattern[plen - 1] == '%');
-     
      info->slices = (char **)palloc(slice_cap * sizeof(char *));
      
-     /* Split by % */
      for (p = pattern; *p; p++)
      {
          if (*p == '%')
@@ -448,7 +575,6 @@
          }
      }
      
-     /* Add final slice if any */
      len = p - start;
      if (len > 0)
      {
@@ -466,22 +592,21 @@
  
  static void free_pattern_info(PatternInfo *info)
  {
-     int i;
-     for (i = 0; i < info->slice_count; i++)
+     for (int i = 0; i < info->slice_count; i++)
          pfree(info->slices[i]);
      pfree(info->slices);
      pfree(info);
  }
  
- /* ==================== CORE MATCHING FUNCTIONS ==================== */
+ /* ==================== OPTIMIZED MATCHING FUNCTIONS ==================== */
  
- /* Match pattern at exact position */
  static RoaringBitmap* match_at_pos(const char *pattern, int start_pos)
  {
      RoaringBitmap *result = NULL;
-     int pos = start_pos;
-     int i, plen = strlen(pattern);
      RoaringBitmap *char_bm, *temp;
+     int pos = start_pos;
+     int plen = strlen(pattern);
+     int i;
      
      for (i = 0; i < plen; i++)
      {
@@ -491,11 +616,13 @@
              continue;
          }
          
+         if (i + 1 < plen && pattern[i + 1] != '_')
+             PREFETCH(get_pos_bitmap((unsigned char)pattern[i + 1], pos + 1));
+         
          char_bm = get_pos_bitmap((unsigned char)pattern[i], pos);
-         if (!char_bm)
+         if (unlikely(!char_bm))
          {
-             if (result)
-                 roaring_free(result);
+             if (result) roaring_free(result);
              return roaring_create();
          }
          
@@ -509,7 +636,7 @@
              roaring_free(result);
              result = temp;
              
-             if (roaring_is_empty(result))
+             if (unlikely(roaring_is_empty(result)))
                  return result;
          }
          pos++;
@@ -518,31 +645,27 @@
      return result ? result : roaring_create();
  }
  
- /* Match pattern at exact position from end
-  * FIXED: Use consistent offset calculation with index building
-  */
  static RoaringBitmap* match_at_neg_pos(const char *pattern, int end_offset)
  {
      RoaringBitmap *result = NULL;
+     RoaringBitmap *char_bm, *temp;
      int plen = strlen(pattern);
      int i, pos;
-     RoaringBitmap *char_bm, *temp;
      
      for (i = plen - 1; i >= 0; i--)
      {
          if (pattern[i] == '_')
-         {
              continue;
-         }
          
-         /* Calculate position from end: pattern[plen-1] is at -1, pattern[plen-2] at -2, etc */
          pos = -(plen - i);
          
+         if (i > 0 && pattern[i - 1] != '_')
+             PREFETCH(get_neg_bitmap((unsigned char)pattern[i - 1], -(plen - i + 1)));
+         
          char_bm = get_neg_bitmap((unsigned char)pattern[i], pos);
-         if (!char_bm)
+         if (unlikely(!char_bm))
          {
-             if (result)
-                 roaring_free(result);
+             if (result) roaring_free(result);
              return roaring_create();
          }
          
@@ -556,7 +679,7 @@
              roaring_free(result);
              result = temp;
              
-             if (roaring_is_empty(result))
+             if (unlikely(roaring_is_empty(result)))
                  return result;
          }
      }
@@ -564,10 +687,10 @@
      return result ? result : roaring_create();
  }
  
- /* Get candidates with required characters (fast pre-filter) */
  static RoaringBitmap* get_char_candidates(const char *pattern)
  {
      RoaringBitmap *result = NULL;
+     RoaringBitmap *temp;
      bool seen[CHAR_RANGE] = {false};
      int i;
      
@@ -577,7 +700,11 @@
          if (pattern[i] != '_' && pattern[i] != '%' && !seen[ch])
          {
              seen[ch] = true;
-             if (global_index->char_cache[ch])
+             
+             if (pattern[i + 1])
+                 PREFETCH(global_index->char_cache[(unsigned char)pattern[i + 1]]);
+             
+             if (likely(global_index->char_cache[ch]))
              {
                  if (!result)
                  {
@@ -585,19 +712,17 @@
                  }
                  else
                  {
-                     RoaringBitmap *temp = roaring_and(result, global_index->char_cache[ch]);
+                     temp = roaring_and(result, global_index->char_cache[ch]);
                      roaring_free(result);
                      result = temp;
                      
-                     if (roaring_is_empty(result))
+                     if (unlikely(roaring_is_empty(result)))
                          return result;
                  }
              }
              else
              {
-                 /* Character doesn't exist in any record */
-                 if (result)
-                     roaring_free(result);
+                 if (result) roaring_free(result);
                  return roaring_create();
              }
          }
@@ -606,8 +731,8 @@
      return result;
  }
  
- /* Check if pattern matches starting at current position (contiguous match with _ wildcards) */
- static bool matches_at_position(const char *str, const char *pattern)
+ /* Optimized contiguous pattern matching */
+ static FORCE_INLINE bool matches_at_position(const char *str, const char *pattern)
  {
      const char *s = str;
      const char *p = pattern;
@@ -616,31 +741,31 @@
      {
          if (*p == '_')
          {
-             if (!*s) return false;  /* underscore needs a char */
+             if (unlikely(!*s)) return false;
              s++;
              p++;
          }
-         else if (*s == *p)
+         else if (likely(*s == *p))
          {
              s++;
              p++;
          }
          else
          {
-             return false;  /* mismatch */
+             return false;
          }
      }
      
-     return true;  /* matched entire pattern */
+     return true;
  }
  
- /* Find next occurrence of pattern in string (returns pointer to match or NULL) */
- static const char* find_pattern(const char *str, const char *pattern)
+ static FORCE_INLINE const char* find_pattern(const char *str, const char *pattern)
  {
      const char *s = str;
      
      while (*s)
      {
+         PREFETCH(s + 64);
          if (matches_at_position(s, pattern))
              return s;
          s++;
@@ -649,15 +774,11 @@
      return NULL;
  }
  
- /* Check if string contains pattern as substring (for %pattern% matching) */
- static bool contains_substring(const char *str, const char *pattern)
+ static FORCE_INLINE bool contains_substring(const char *str, const char *pattern)
  {
      return find_pattern(str, pattern) != NULL;
  }
  
- /* Verify multi-slice pattern matches - ensures slices appear as CONTIGUOUS patterns in order
-  * This is critical for patterns like %a_b%c% where we need actual pattern matches, not just subsequences
-  */
  static RoaringBitmap* verify_multislice_pattern(RoaringBitmap *candidates, PatternInfo *info)
  {
      uint64_t count, i, j;
@@ -666,6 +787,7 @@
      const char *str;
      const char *search_start;
      const char *match_pos;
+     const char *slice_ptr;
      bool all_found;
      RoaringBitmap *verified = roaring_create();
      
@@ -677,28 +799,28 @@
      for (i = 0; i < count; i++)
      {
          idx = indices[i];
+         
+         if (i + 1 < count)
+             PREFETCH(global_index->data[indices[i + 1]]);
+         
          str = global_index->data[idx];
          search_start = str;
          all_found = true;
          
-         /* Each slice must be found as a contiguous pattern match, in order */
          for (j = 0; j < info->slice_count; j++)
          {
              const char *slice = info->slices[j];
              
-             /* Find this slice as a contiguous pattern starting from search_start */
              match_pos = find_pattern(search_start, slice);
              
-             if (!match_pos)
+             if (unlikely(!match_pos))
              {
                  all_found = false;
                  break;
              }
              
-             /* Move search position past this match for next slice */
              search_start = match_pos;
-             /* Advance past the pattern match */
-             const char *slice_ptr = slice;
+             slice_ptr = slice;
              while (*search_start && *slice_ptr)
              {
                  if (*slice_ptr == '_' || *search_start == *slice_ptr)
@@ -713,17 +835,14 @@
              }
          }
          
-         if (all_found)
-         {
+         if (likely(all_found))
              roaring_add(verified, idx);
-         }
      }
      
      pfree(indices);
      return verified;
  }
  
- /* Get length range bitmap */
  static RoaringBitmap* get_length_range(int min_len, int max_len)
  {
      RoaringBitmap *result = roaring_create();
@@ -754,8 +873,19 @@
      RoaringBitmap *result = NULL;
      RoaringBitmap *temp, *candidates, *temp2, *temp3;
      uint32_t *indices;
-     int i;
+     uint32_t *cand_indices;
+     uint64_t i, cand_count;
      int min_len;
+     
+     /* Check cache first */
+     CacheEntry *cached = cache_lookup(pattern);
+     if (cached)
+     {
+         indices = (uint32_t *)palloc(cached->count * sizeof(uint32_t));
+         memcpy(indices, cached->results, cached->count * sizeof(uint32_t));
+         *result_count = cached->count;
+         return indices;
+     }
      
      /* Pattern: % - match all */
      if (strcmp(pattern, "%") == 0)
@@ -785,9 +915,8 @@
      {
          const char *slice = info->slices[0];
          
-         /* Get character candidates first */
          candidates = get_char_candidates(slice);
-         if (roaring_is_empty(candidates))
+         if (unlikely(roaring_is_empty(candidates)))
          {
              free_pattern_info(info);
              roaring_free(candidates);
@@ -800,7 +929,6 @@
          {
              result = match_at_pos(slice, 0);
              
-             /* Exact length constraint */
              if (strlen(slice) < global_index->length_idx.max_length && 
                  global_index->length_idx.length_bitmaps[strlen(slice)])
              {
@@ -833,40 +961,28 @@
          /* Case: %pattern% */
          else
          {
-             /* For substring, verify actual containment */
-             if (candidates)
+             result = roaring_create();
+             cand_indices = roaring_to_array(candidates, &cand_count);
+             
+             if (cand_indices)
              {
-                 result = roaring_create();
-                 uint64_t cand_count;
-                 uint32_t *cand_indices = roaring_to_array(candidates, &cand_count);
-                 uint64_t i;
-                 
-                 if (cand_indices)
+                 for (i = 0; i < cand_count; i++)
                  {
-                     for (i = 0; i < cand_count; i++)
-                     {
-                         uint32_t idx = cand_indices[i];
-                         const char *str = global_index->data[idx];
-                         
-                         /* Check if pattern appears as contiguous substring */
-                         if (contains_substring(str, slice))
-                         {
-                             roaring_add(result, idx);
-                         }
-                     }
-                     pfree(cand_indices);
+                     uint32_t idx = cand_indices[i];
+                     
+                     if (i + 1 < cand_count)
+                         PREFETCH(global_index->data[cand_indices[i + 1]]);
+                     
+                     const char *str = global_index->data[idx];
+                     
+                     if (contains_substring(str, slice))
+                         roaring_add(result, idx);
                  }
-                 roaring_free(candidates);
-                 candidates = NULL;
-             }
-             else
-             {
-                 result = roaring_create();
+                 pfree(cand_indices);
              }
          }
          
-         if (candidates)
-             roaring_free(candidates);
+         roaring_free(candidates);
      }
      /* Multiple slices */
      else
@@ -894,7 +1010,7 @@
                  candidates = temp2;
              }
              
-             if (roaring_is_empty(candidates))
+             if (unlikely(roaring_is_empty(candidates)))
              {
                  roaring_free(candidates);
                  free_pattern_info(info);
@@ -909,7 +1025,7 @@
          roaring_free(candidates);
          roaring_free(temp);
          
-         if (roaring_is_empty(result))
+         if (unlikely(roaring_is_empty(result)))
          {
              roaring_free(result);
              free_pattern_info(info);
@@ -926,7 +1042,7 @@
              roaring_free(temp);
              result = temp3;
              
-             if (roaring_is_empty(result))
+             if (unlikely(roaring_is_empty(result)))
              {
                  roaring_free(result);
                  free_pattern_info(info);
@@ -943,7 +1059,7 @@
              roaring_free(temp);
              result = temp3;
              
-             if (roaring_is_empty(result))
+             if (unlikely(roaring_is_empty(result)))
              {
                  roaring_free(result);
                  free_pattern_info(info);
@@ -952,10 +1068,7 @@
              }
          }
          
-         /* CRITICAL FIX: For multi-slice patterns, we need to verify that slices match as 
-          * CONTIGUOUS patterns (not just subsequences) in the correct order.
-          * This fixes overcounting in patterns like %a_b%c% and ab%cd%ef%
-          */
+         /* Verify multi-slice patterns with contiguous matching */
          RoaringBitmap *verified = verify_multislice_pattern(result, info);
          roaring_free(result);
          result = verified;
@@ -963,9 +1076,13 @@
      
      free_pattern_info(info);
      
-     /* Return results - Roaring bitmaps are inherently deduplicated */
      indices = roaring_to_array(result, result_count);
      roaring_free(result);
+     
+     /* Cache results */
+     if (indices && *result_count > 0 && *result_count < 50000)
+         cache_insert(pattern, indices, *result_count);
+     
      return indices;
  }
  
@@ -996,7 +1113,7 @@
      int neg_offset;
      
      INSTR_TIME_SET_CURRENT(start_time);
-     elog(INFO, "Building optimized Roaring bitmap index...");
+     elog(INFO, "Building ULTIMATE optimized index (hash tables + hardware opts)...");
      
      if (SPI_connect() != SPI_OK_CONNECT)
          ereport(ERROR, (errmsg("SPI_connect failed")));
@@ -1030,25 +1147,19 @@
      global_index->memory_used = 0;
      global_index->data = (char **)MemoryContextAlloc(index_context, num_records * sizeof(char *));
      
-     /* Initialize pos_idx and neg_idx */
+     /* Initialize hash tables */
      for (ch_idx = 0; ch_idx < CHAR_RANGE; ch_idx++)
      {
-         global_index->pos_idx[ch_idx].entries = (PosEntry *)MemoryContextAlloc(index_context, 64 * sizeof(PosEntry));
-         global_index->pos_idx[ch_idx].count = 0;
-         global_index->pos_idx[ch_idx].capacity = 64;
-         
-         global_index->neg_idx[ch_idx].entries = (PosEntry *)MemoryContextAlloc(index_context, 64 * sizeof(PosEntry));
-         global_index->neg_idx[ch_idx].count = 0;
-         global_index->neg_idx[ch_idx].capacity = 64;
-         
+         memset(global_index->pos_idx[ch_idx].buckets, 0, sizeof(PosHashEntry*) * HASH_TABLE_SIZE);
+         memset(global_index->neg_idx[ch_idx].buckets, 0, sizeof(PosHashEntry*) * HASH_TABLE_SIZE);
          global_index->char_cache[ch_idx] = NULL;
      }
      
-     /* Initialize length index */
      global_index->length_idx.max_length = 0;
      global_index->length_idx.length_bitmaps = NULL;
+     init_query_cache();
      
-     elog(INFO, "Initialized index structures");
+     elog(INFO, "Initialized index structures (hash tables, cache, bloom filter)");
      
      /* Build index from data */
      for (idx = 0; idx < num_records; idx++)
@@ -1090,7 +1201,7 @@
              }
              roaring_add(existing_bm, (uint32_t)idx);
              
-             /* Backward (negative) index with consistent offset calculation */
+             /* Backward (negative) index */
              neg_offset = -(1 + pos);
              uch = (unsigned char)str[len - 1 - pos];
              
@@ -1108,26 +1219,32 @@
      
      elog(INFO, "Index building complete, building char cache...");
      
-     /* Build character-anywhere cache */
+     /* Build character cache */
      for (ch_idx = 0; ch_idx < CHAR_RANGE; ch_idx++)
      {
-         RoaringBitmap *new_bm = NULL;
-         CharIndex *cidx = &global_index->pos_idx[ch_idx];
+         RoaringBitmap *char_bm = NULL;
          
-         if (cidx->count == 0)
-             continue;
-         
-         new_bm = roaring_copy(cidx->entries[0].bitmap);
-         
-         for (i = 1; i < cidx->count; i++)
+         for (int bucket = 0; bucket < HASH_TABLE_SIZE; bucket++)
          {
-             RoaringBitmap *temp = roaring_or(new_bm, cidx->entries[i].bitmap);
-             roaring_free(new_bm);
-             new_bm = temp;
+             PosHashEntry *entry = global_index->pos_idx[ch_idx].buckets[bucket];
+             while (entry)
+             {
+                 if (!char_bm)
+                 {
+                     char_bm = roaring_copy(entry->bitmap);
+                 }
+                 else
+                 {
+                     RoaringBitmap *temp = roaring_or(char_bm, entry->bitmap);
+                     roaring_free(char_bm);
+                     char_bm = temp;
+                 }
+                 entry = entry->next;
+             }
          }
          
-         if (new_bm)
-             global_index->char_cache[ch_idx] = new_bm;
+         if (char_bm)
+             global_index->char_cache[ch_idx] = char_bm;
      }
      
      elog(INFO, "Character cache complete");
@@ -1178,8 +1295,11 @@
      ms = INSTR_TIME_GET_MILLISEC(end_time);
      
      elog(INFO, "Build time: %.0f ms", ms);
-     elog(INFO, "Index: %d records, max_len=%d, memory=%zu bytes",
-          num_records, global_index->max_len, global_index->memory_used);
+     elog(INFO, "Index: %d records, max_len=%d, memory=%zu bytes (%.2f MB)",
+          num_records, global_index->max_len, global_index->memory_used,
+          global_index->memory_used / (1024.0 * 1024.0));
+     elog(INFO, "Optimizations: Hash tables (4096 buckets), prefetch, bloom filter, cache (%d slots)",
+          QUERY_CACHE_SIZE);
      
      PG_RETURN_BOOL(true);
  }
@@ -1284,18 +1404,38 @@
      }
      
      initStringInfo(&buf);
-     appendStringInfo(&buf, "Roaring Bitmap Index Status:\n");
+     appendStringInfo(&buf, "ULTIMATE Roaring Bitmap Index Status:\n");
      appendStringInfo(&buf, "  Records: %d\n", global_index->num_records);
      appendStringInfo(&buf, "  Max length: %d\n", global_index->max_len);
-     appendStringInfo(&buf, "  Memory used: %zu bytes\n", global_index->memory_used);
-     appendStringInfo(&buf, "  Index type: Roaring Bitmap compression\n");
-     appendStringInfo(&buf, "  Supports: '%%' (multi-char wildcard), '_' (single-char wildcard)\n");
+     appendStringInfo(&buf, "  Memory used: %zu bytes (%.2f MB)\n", 
+                     global_index->memory_used,
+                     global_index->memory_used / (1024.0 * 1024.0));
+     appendStringInfo(&buf, "\nOptimizations:\n");
+     appendStringInfo(&buf, "  - Hash tables: %d buckets/char (O(1) lookup)\n", HASH_TABLE_SIZE);
+     appendStringInfo(&buf, "  - Query cache: %d slots with bloom filter\n", QUERY_CACHE_SIZE);
+     appendStringInfo(&buf, "  - CPU prefetching & branch hints\n");
+     appendStringInfo(&buf, "  - Cache-aligned structures (64 bytes)\n");
+     appendStringInfo(&buf, "  - Loop unrolling (4x)\n");
+     appendStringInfo(&buf, "  - Contiguous pattern matching\n");
+     appendStringInfo(&buf, "  - Hardware popcount (SIMD)\n");
+     appendStringInfo(&buf, "\nSupported: '%%' (multi-char), '_' (single-char)\n");
      
      #ifdef HAVE_ROARING
-     appendStringInfo(&buf, "  Backend: Native Roaring library\n");
+     appendStringInfo(&buf, "Backend: Native CRoaring library\n");
      #else
-     appendStringInfo(&buf, "  Backend: Fallback bitmap implementation\n");
+     appendStringInfo(&buf, "Backend: Optimized fallback bitmap\n");
      #endif
      
      PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+ }
+ 
+ PG_FUNCTION_INFO_V1(optimized_like_clear_cache);
+ Datum optimized_like_clear_cache(PG_FUNCTION_ARGS)
+ {
+     if (!global_index)
+         PG_RETURN_TEXT_P(cstring_to_text("No index loaded."));
+     
+     init_query_cache();
+     
+     PG_RETURN_TEXT_P(cstring_to_text("Query cache cleared successfully."));
  }
